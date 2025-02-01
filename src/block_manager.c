@@ -40,13 +40,13 @@ int block_manager_open(block_manager_t **bm, const char *file_path, float fsync_
     /* we set the stop fsync thread flag to 0 */
     (*bm)->stop_fsync_thread = 0;
 
-    /* we create and start the fsync thread */
-    if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
-    {
-        fclose((*bm)->file);
-        free(*bm);
-        return -1;
-    }
+    // /* we create and start the fsync thread */
+    // if (pthread_create(&(*bm)->fsync_thread, NULL, block_manager_fsync_thread, *bm) != 0)
+    // {
+    //     fclose((*bm)->file);
+    //     free(*bm);
+    //     return -1;
+    // }
     return 0;
 }
 
@@ -59,7 +59,7 @@ int block_manager_close(block_manager_t *bm)
     (void)fsync(fileno(bm->file)); /* flush file to disk */
 
     /* we join the fsync thread */
-    if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
+    // if (pthread_join(bm->fsync_thread, NULL) != 0) return -1;
 
     /* we close the file */
     if (fclose(bm->file) != 0) return -1;
@@ -110,6 +110,63 @@ long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block
     if (fwrite(block->data, block->size, 1, bm->file) != 1) return -1;
 
     return offset;
+}
+
+long block_manager_block_write_async(block_manager_t *bm, block_manager_block_t *block, struct io_uring *ring) {
+    // Get the current file offset (end of file)
+    off_t offset = lseek(fileno(bm->file), 0, SEEK_END);
+    if (offset == -1) {
+        perror("lseek");
+        return -1;
+    }
+
+    // Create a buffer to hold both the size and data
+    size_t total_size = sizeof(uint64_t) + block->size;
+    void *buffer = malloc(total_size);
+    if (!buffer) {
+        perror("malloc");
+        return -1;
+    }
+
+    // Copy the size and data into the buffer
+    memcpy(buffer, &block->size, sizeof(uint64_t));
+    memcpy(buffer + sizeof(uint64_t), block->data, block->size);
+
+    // Prepare the write request
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        fprintf(stderr, "Failed to get SQE\n");
+        free(buffer);
+        return -1;
+    }
+    io_uring_prep_write(sqe, fileno(bm->file), buffer, total_size, offset);
+
+    // Set user data to track this request (optional but useful for debugging)
+    io_uring_sqe_set_data(sqe, buffer);
+
+    // Submit the request
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_submit failed: %s\n", strerror(-ret));
+        free(buffer);
+        return -1;
+    }
+
+    // Return the offset where the block was written
+    return offset;
+}
+
+int block_manager_block_write_async_check_completion(struct io_uring *ring) {
+    struct io_uring_cqe *cqe;
+    while (io_uring_peek_cqe(ring, &cqe) != 0) {};
+    // Process the completion
+    if (cqe->res < 0) {
+        fprintf(stderr, "Async write failed: %s\n", strerror(-cqe->res));
+        return -1;
+    }
+    io_uring_cqe_seen(ring, cqe);
+
+    return 0;
 }
 
 block_manager_block_t *block_manager_block_read(block_manager_t *bm)

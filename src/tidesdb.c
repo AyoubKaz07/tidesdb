@@ -494,6 +494,18 @@ tidesdb_err_t *tidesdb_open(const char *directory, tidesdb_t **tdb)
         return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "tidesdb_t");
     }
 
+    /* initialize io_uring */
+    (*tdb)->ring = malloc(sizeof(struct io_uring));
+    if ((*tdb)->ring == NULL) {
+        free(*tdb);
+        return tidesdb_err_from_code(TIDESDB_ERR_MEMORY_ALLOC, "io_uring");
+    }
+
+    if (io_uring_queue_init(32, (*tdb)->ring, 0) < 0) {
+        free(*tdb);
+        return tidesdb_err_from_code(TIDESDB_ERR_IO_URING_INIT, "tidesdb_t");
+    }
+
     /* we make sure the db path is not too long
      * we use block manager MAX_FILE_PATH_LENGTH to check against */
     if (strlen(directory) > MAX_FILE_PATH_LENGTH)
@@ -836,6 +848,11 @@ tidesdb_err_t *tidesdb_close(tidesdb_t *tdb)
 
     (void)log_write(tdb->log, _tidesdb_get_debug_log_format(TIDESDB_DEBUG_CLOSING_DATABASE),
                     tdb->directory);
+
+    /* clean up io_uring */
+    (void)io_uring_queue_exit((tdb)->ring);
+
+    free(tdb->ring);
 
     (void)_tidesdb_free_column_families(tdb);
 
@@ -3498,6 +3515,7 @@ tidesdb_err_t *tidesdb_compact_sstables(tidesdb_t *tdb, const char *column_famil
         args->end = i + 1;
         args->sem = &sem;
         args->lock = &lock;
+        args->ring = tdb->ring;
 
         pthread_t thread;
         (void)pthread_create(&thread, NULL, _tidesdb_compact_sstables_thread, args);
@@ -3549,13 +3567,13 @@ void *_tidesdb_compact_sstables_thread(void *arg)
     {
         /* merge the current and ith+1 sstables */
         merged_sstable =
-            _tidesdb_merge_sstables(cf->sstables[start], cf->sstables[end], cf, args->lock);
+            _tidesdb_merge_sstables(cf->sstables[start], cf->sstables[end], cf, args->lock, args->ring);
     }
     else
     {
         /* with bloom filter */
         merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(cf->sstables[start],
-                                                                cf->sstables[end], cf, args->lock);
+                                                                cf->sstables[end], cf, args->lock, args->ring);
     }
 
     /* check if the merged sstable is NULL */
@@ -3567,6 +3585,8 @@ void *_tidesdb_compact_sstables_thread(void *arg)
             tidesdb_err_from_code(TIDESDB_ERR_FAILED_TO_MERGE_SSTABLES, cf->config.name)->message);
         return NULL;
     }
+
+    block_manager_block_write_async_check_completion(args->ring);
 
     /* remove old sstable files */
     char sstable_path1[MAX_FILE_PATH_LENGTH];
@@ -3650,7 +3670,8 @@ void *_tidesdb_compact_sstables_thread(void *arg)
 
 tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_sstable_t *sst2,
                                            tidesdb_column_family_t *cf,
-                                           pthread_mutex_t *shared_lock)
+                                           pthread_mutex_t *shared_lock,
+                                           struct io_uring *ring)
 {
     (void)log_write(cf->tdb->log,
                     _tidesdb_get_debug_log_format(TIDESDB_DEBUG_MERGING_PAIR_SSTABLES),
@@ -3698,7 +3719,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_ssta
     }
 
     if (_tidesdb_merge_sort(cf, sst1->block_manager, sst2->block_manager,
-                            merged_sstable->block_manager) == -1)
+                            merged_sstable->block_manager, ring) == -1)
     {
         (void)block_manager_close(merged_sstable->block_manager);
         (void)remove(sstable_path);
@@ -5135,7 +5156,8 @@ int _tidesdb_is_expired(int64_t ttl)
 tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst1,
                                                           tidesdb_sstable_t *sst2,
                                                           tidesdb_column_family_t *cf,
-                                                          pthread_mutex_t *shared_lock)
+                                                          pthread_mutex_t *shared_lock,
+                                                          struct io_uring *ring)
 {
     /*
      * similar to _tidesdb_merge_sstables but with bloom filter
@@ -5309,7 +5331,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst
     }
 
     /* we write the block to the merged sstable */
-    if (block_manager_block_write(merged_sstable->block_manager, bf_block) == -1)
+    if (block_manager_block_write_async(merged_sstable->block_manager, bf_block, ring) == -1)
     {
         (void)block_manager_block_free(bf_block);
         free(bf_serialized);
@@ -5324,7 +5346,7 @@ tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst
 
     /* now we sort merge the sstables */
     if (_tidesdb_merge_sort(cf, sst1->block_manager, sst2->block_manager,
-                            merged_sstable->block_manager) == -1)
+                            merged_sstable->block_manager, ring) == -1)
     {
         (void)remove(sstable_path);
         free(merged_sstable);
@@ -6465,6 +6487,7 @@ tidesdb_err_t *tidesdb_start_background_partial_merge(tidesdb_t *tdb,
 
     args->cf = cf;
     args->tdb = tdb;
+    args->ring = tdb->ring;
 
     pthread_mutex_t *lock = malloc(sizeof(pthread_mutex_t)); /* shared lock for unique file names */
     if (lock == NULL)
@@ -6565,12 +6588,12 @@ void *_tidesdb_partial_merge_thread(void *arg)
         if (cf->config.bloom_filter == false)
         {
             merged_sstable = _tidesdb_merge_sstables(cf->sstables[sst_index],
-                                                     cf->sstables[sst_index + 1], cf, args->lock);
+                                                     cf->sstables[sst_index + 1], cf, args->lock, args->ring);
         }
         else
         {
             merged_sstable = _tidesdb_merge_sstables_w_bloom_filter(
-                cf->sstables[sst_index], cf->sstables[sst_index + 1], cf, args->lock);
+                cf->sstables[sst_index], cf->sstables[sst_index + 1], cf, args->lock, args->ring);
         }
 
         /* lock column family for writes */
@@ -6661,6 +6684,8 @@ void *_tidesdb_partial_merge_thread(void *arg)
                         sst_index + 1, cf->config.name);
     }
 
+    block_manager_block_write_async_check_completion(args->ring);
+
     (void)pthread_mutex_destroy(args->lock);
     free(args->lock);
     free(args);
@@ -6709,7 +6734,7 @@ size_t _tidesdb_get_available_mem()
 }
 
 int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
-                        block_manager_t *bm_out)
+                        block_manager_t *bm_out, struct io_uring *ring)
 {
     /* we check if the block managers are NULL */
     if (bm1 == NULL || bm2 == NULL || bm_out == NULL)
@@ -6781,7 +6806,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                 !_tidesdb_is_expired(kv2->ttl))
             {
-                int64_t offset = block_manager_block_write(bm_out, block2);
+                int64_t offset = block_manager_block_write_async(bm_out, block2, ring);
                 if (offset != 0)
                 {
                     (void)block_manager_block_free(block2);
@@ -6813,7 +6838,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) &&
                 !_tidesdb_is_expired(kv1->ttl))
             {
-                int64_t offset = block_manager_block_write(bm_out, block1);
+                int64_t offset = block_manager_block_write_async(bm_out, block1, ring);
                 if (offset != 0)
                 {
                     (void)block_manager_block_free(block1);
@@ -6852,7 +6877,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    int64_t offset = block_manager_block_write_async(bm_out, block2, ring);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -6878,7 +6903,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(block1->data, block1->size) &&
                     !_tidesdb_is_expired(kv1->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block1);
+                    int64_t offset = block_manager_block_write_async(bm_out, block1, ring);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -6904,7 +6929,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
                 if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) &&
                     !_tidesdb_is_expired(kv2->ttl))
                 {
-                    int64_t offset = block_manager_block_write(bm_out, block2);
+                    int64_t offset = block_manager_block_write_async(bm_out, block2, ring);
                     if (offset != 0)
                     {
                         if (TDB_BLOCK_INDICES)
@@ -6939,7 +6964,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             block1->data, block1->size, cf->config.compressed, cf->config.compress_algo);
         if (!_tidesdb_is_tombstone(kv1->value, kv1->value_size) && !_tidesdb_is_expired(kv1->ttl))
         {
-            int64_t offset = block_manager_block_write(bm_out, block1);
+            int64_t offset = block_manager_block_write_async(bm_out, block1, ring);
             if (offset != 0)
             {
                 if (TDB_BLOCK_INDICES)
@@ -6971,7 +6996,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
             block2->data, block2->size, cf->config.compressed, cf->config.compress_algo);
         if (!_tidesdb_is_tombstone(kv2->value, kv2->value_size) && !_tidesdb_is_expired(kv2->ttl))
         {
-            int64_t offset = block_manager_block_write(bm_out, block2);
+            int64_t offset = block_manager_block_write_async(bm_out, block2, ring);
             if (offset != 0)
             {
                 if (TDB_BLOCK_INDICES)
@@ -7026,7 +7051,7 @@ int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block
 
         free(bha_data);
 
-        if (block_manager_block_write(bm_out, bha_block) == -1)
+        if (block_manager_block_write_async(bm_out, bha_block, ring) == -1)
         {
             (void)log_write(
                 cf->tdb->log,

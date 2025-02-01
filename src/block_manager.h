@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <liburing.h>
 
 #include "compat.h"
 
@@ -109,6 +110,17 @@ block_manager_block_t *block_manager_block_create(uint64_t size, void *data);
  * @return block offset if successful, -1 if not
  */
 long block_manager_block_write(block_manager_t *bm, block_manager_block_t *block);
+
+/**
+ * block_manager_block_write_async(
+ * writes a block to a file
+ * @param bm the block manager to write the block to
+ * @param block the block to write
+ * @return block offset if successful, -1 if not
+ */
+long block_manager_block_write_async(block_manager_t *bm, block_manager_block_t *block, struct io_uring *ring);
+
+int block_manager_block_write_async_check_completion(struct io_uring *ring);
 
 /**
  * block_manager_block_read

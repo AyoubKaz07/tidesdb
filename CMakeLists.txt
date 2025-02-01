@@ -28,6 +28,14 @@ endif()
 
 include_directories(external) # for external libraries linking internally
 
+# Find liburing manually
+find_library(LIBURING_LIBRARY NAMES uring)
+find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+
+if (NOT LIBURING_LIBRARY OR NOT LIBURING_INCLUDE_DIR)
+    message(FATAL_ERROR "liburing not found. Please install liburing.")
+endif()
+
 add_library(tidesdb src/tidesdb.c src/err.c src/block_manager.c src/skip_list.c src/compress.c src/bloom_filter.c src/hash_table.c src/binary_hash_array.c src/log.c external/xxhash.c)
 
 target_include_directories(tidesdb PRIVATE src)
@@ -43,6 +51,7 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
                 zstd    # zstandard compression
                 snappy  # snappy compression
                 pthread # pthread library
+                ${LIBURING_LIBRARY} # liburing
         )
 elseif(APPLE)
         # for intel macs, homebrew typically installs in /usr/local
@@ -55,9 +64,10 @@ elseif(APPLE)
                 zstd    # zstandard compression
                 snappy  # snappy compression
                 pthread # pthread library
+                ${LIBURING_LIBRARY} # liburing
         )
 else()
-        target_link_libraries(tidesdb PUBLIC zstd snappy lz4 pthread)
+        target_link_libraries(tidesdb PUBLIC zstd snappy lz4 pthread ${LIBURING_LIBRARY})
         find_library(MATH_LIBRARY m)
         if(MATH_LIBRARY)
                 target_link_libraries(tidesdb PUBLIC ${MATH_LIBRARY})

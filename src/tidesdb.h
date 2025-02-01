@@ -37,6 +37,7 @@ extern "C"
 #include "hash_table.h"
 #include "log.h"
 #include "skip_list.h"
+#include <liburing.h>
 
     /* TidesDB uses tidesdb, _tidesdb_, and TDB as prefixes for functions, types, and constants */
 
@@ -330,6 +331,7 @@ extern "C"
         log_t *log;
         size_t available_mem;
         int avail_threads;
+        struct io_uring *ring;
     };
 
     /*
@@ -386,6 +388,7 @@ extern "C"
         int end;                     /* the end index for the sstables */
         sem_t *sem;                  /* semaphore to limit concurrent threads */
         pthread_mutex_t *lock;       /* lock for the path creation on parallel compaction */
+        struct io_uring *ring;
     } tidesdb_compact_thread_args_t;
 
     /*
@@ -400,6 +403,7 @@ extern "C"
         tidesdb_t *tdb;
         tidesdb_column_family_t *cf;
         pthread_mutex_t *lock;
+        struct io_uring *ring;
     } tidesdb_partial_merge_thread_args_t;
 
     /* functions prefixed with _ are internal functions */
@@ -891,7 +895,8 @@ extern "C"
      */
     tidesdb_sstable_t *_tidesdb_merge_sstables(tidesdb_sstable_t *sst1, tidesdb_sstable_t *sst2,
                                                tidesdb_column_family_t *cf,
-                                               pthread_mutex_t *shared_lock);
+                                               pthread_mutex_t *shared_lock,
+                                               struct io_uring *ring);
 
     /*
      * _tidesdb_merge_sstables_w_bloom_filter
@@ -905,7 +910,8 @@ extern "C"
     tidesdb_sstable_t *_tidesdb_merge_sstables_w_bloom_filter(tidesdb_sstable_t *sst1,
                                                               tidesdb_sstable_t *sst2,
                                                               tidesdb_column_family_t *cf,
-                                                              pthread_mutex_t *shared_lock);
+                                                              pthread_mutex_t *shared_lock, 
+                                                              struct io_uring *ring);
 
     /*
      * _tidesdb_free_column_families
@@ -1067,7 +1073,7 @@ extern "C"
      * @return 0 if the sstables were merged, -1 if not
      */
     int _tidesdb_merge_sort(tidesdb_column_family_t *cf, block_manager_t *bm1, block_manager_t *bm2,
-                            block_manager_t *bm_out);
+                            block_manager_t *bm_out, struct io_uring *ring);
 
     /*
      * _tidesdb_get_debug_log_format

@@ -23,6 +23,8 @@
 #define KEY_SIZE       16
 #define VALUE_SIZE     100
 #define CF_NAME        "benchmark_cf"
+// #define NUM_THREADS    4
+// #define NUM_THREADS    6
 #define NUM_THREADS    4
 
 /*
